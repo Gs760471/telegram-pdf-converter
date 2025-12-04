@@ -6,7 +6,7 @@ import traceback
 from flask import Flask, request
 
 import pdfplumber
-import pandas as pd
+from openpyxl import Workbook
 
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, MessageHandler, CommandHandler, Filters
@@ -30,27 +30,32 @@ if not TOKEN:
 bot = Bot(TOKEN)
 app = Flask(__name__)
 
-# Dispatcher for handling updates via webhook
 dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
 
 # Active jobs: chat_id -> {"cancel_event": Event, "thread": Thread}
 active_jobs = {}
 jobs_lock = threading.Lock()
 
-# Limits (you can tweak these)
-MAX_PAGES = 12000          # hard safety limit
-PROGRESS_STEPS = 10        # how many times to update progress message
+# Limits – tune these for Render free tier
+MAX_PAGES = 3000                  # hard safety limit on pages to process
+MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB – reject bigger PDFs
+PROGRESS_STEPS = 10               # how many times to update progress
 
 
 # -------------------------------------------------------------------
-# Helper: background worker for PDF -> Excel
+# Background worker: PDF -> Excel with low memory use
 # -------------------------------------------------------------------
-def process_pdf_async(chat_id: int, status_message_id: int,
-                      pdf_path: str, excel_path: str,
-                      cancel_event: threading.Event) -> None:
+def process_pdf_async(
+    chat_id: int,
+    status_message_id: int,
+    pdf_path: str,
+    excel_path: str,
+    cancel_event: threading.Event,
+) -> None:
     """
     Runs in a background thread.
-    Converts PDF to Excel while updating progress and respecting /stop.
+    Reads PDF page-by-page and writes directly to an Excel workbook.
+    Avoids building huge lists in RAM.
     """
     logger.info("Starting background job for chat_id=%s, pdf=%s", chat_id, pdf_path)
     try:
@@ -60,7 +65,12 @@ def process_pdf_async(chat_id: int, status_message_id: int,
             text="Processing your PDF… ⏳",
         )
 
-        all_rows = []
+        # Create workbook in memory (more efficient than pandas DataFrame for big data)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Data"
+
+        total_pages_to_process = 0
 
         with pdfplumber.open(pdf_path) as pdf:
             total_pages = len(pdf.pages)
@@ -75,11 +85,13 @@ def process_pdf_async(chat_id: int, status_message_id: int,
             if total_pages > MAX_PAGES:
                 logger.warning(
                     "PDF too large: %s pages for chat_id=%s. Limiting to %s pages.",
-                    total_pages, chat_id, MAX_PAGES
+                    total_pages,
+                    chat_id,
+                    MAX_PAGES,
                 )
+
             total_pages_to_process = min(total_pages, MAX_PAGES)
 
-            # progress update every "step" pages
             step = max(1, total_pages_to_process // PROGRESS_STEPS)
 
             for i in range(total_pages_to_process):
@@ -92,34 +104,42 @@ def process_pdf_async(chat_id: int, status_message_id: int,
                     )
                     return
 
+                page_num = i + 1
                 page = pdf.pages[i]
+
                 try:
                     table = page.extract_table()
                 except Exception as e:
-                    logger.exception("Error extracting table on page %s: %s", i + 1, e)
+                    logger.exception(
+                        "Error extracting table on page %s for chat_id=%s: %s",
+                        page_num,
+                        chat_id,
+                        e,
+                    )
                     table = None
 
                 if table:
                     for row in table:
-                        all_rows.append(row)
+                        # row is a list of cell values
+                        ws.append(row)
 
-                # Progress edit
-                if (i + 1) % step == 0 or i + 1 == total_pages_to_process:
-                    percent = int((i + 1) * 100 / total_pages_to_process)
+                # Update progress
+                if page_num % step == 0 or page_num == total_pages_to_process:
+                    percent = int(page_num * 100 / total_pages_to_process)
                     try:
                         bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=status_message_id,
                             text=(
                                 f"Processing… {percent}% done ⏳ "
-                                f"({i + 1}/{total_pages_to_process} pages)"
+                                f"({page_num}/{total_pages_to_process} pages)"
                             ),
                         )
                     except Exception as e:
-                        # Just log; not fatal
-                        logger.warning("Failed to edit message for progress: %s", e)
+                        logger.warning("Failed to edit progress message: %s", e)
 
-        if not all_rows:
+        # If no rows wrote to sheet (only header exists or nothing at all)
+        if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=status_message_id,
@@ -127,9 +147,8 @@ def process_pdf_async(chat_id: int, status_message_id: int,
             )
             return
 
-        # Write to Excel
-        df = pd.DataFrame(all_rows)
-        df.to_excel(excel_path, index=False)
+        # Save workbook to disk
+        wb.save(excel_path)
 
         bot.edit_message_text(
             chat_id=chat_id,
@@ -137,7 +156,6 @@ def process_pdf_async(chat_id: int, status_message_id: int,
             text="✅ Conversion complete! Sending your Excel file…",
         )
 
-        # Send file
         with open(excel_path, "rb") as f:
             bot.send_document(
                 chat_id=chat_id,
@@ -160,7 +178,7 @@ def process_pdf_async(chat_id: int, status_message_id: int,
         except Exception as inner_e:
             logger.warning("Failed to edit message after error: %s", inner_e)
     finally:
-        # Cleanup job + temp files
+        # Cleanup
         with jobs_lock:
             active_jobs.pop(chat_id, None)
         try:
@@ -181,7 +199,8 @@ def start(update, context):
     update.message.reply_text(
         "Hi! 👋\n\n"
         "Send me a *PDF with tables* and I’ll convert it to Excel 📊\n"
-        "You can send /stop to cancel a running conversion.",
+        "You can send /stop to cancel a running conversion.\n\n"
+        "_Note: very large PDFs may be partially processed due to server limits._",
         parse_mode="Markdown",
     )
 
@@ -217,6 +236,20 @@ def handle_pdf(update, context):
         message.reply_text("Please upload a PDF file 😄")
         return
 
+    # File size limit to avoid OOM on Render
+    if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
+        mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
+        message.reply_text(
+            f"⚠️ This PDF is too large for this bot (limit ~{mb} MB).\n"
+            "Please split the file or process it in parts."
+        )
+        logger.warning(
+            "Rejected file from chat_id=%s due to size: %s bytes",
+            chat_id,
+            document.file_size,
+        )
+        return
+
     with jobs_lock:
         existing = active_jobs.get(chat_id)
         if existing:
@@ -226,7 +259,7 @@ def handle_pdf(update, context):
             )
             return
 
-    # Download to /tmp
+    # Download PDF to /tmp
     pdf_path = f"/tmp/{document.file_name}"
     excel_path = pdf_path.replace(".pdf", ".xlsx")
 
@@ -239,11 +272,9 @@ def handle_pdf(update, context):
         message.reply_text("❌ Failed to download the PDF from Telegram.")
         return
 
-    # Initial status message
     status_message = message.reply_text("Starting PDF processing… ⏳")
     status_message_id = status_message.message_id
 
-    # Create cancel event + thread
     cancel_event = threading.Event()
     thread = threading.Thread(
         target=process_pdf_async,
@@ -262,7 +293,7 @@ def handle_pdf(update, context):
 
 
 # -------------------------------------------------------------------
-# Register handlers with dispatcher
+# Register handlers
 # -------------------------------------------------------------------
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("stop", stop))
@@ -295,9 +326,6 @@ def webhook():
     return "ok", 200
 
 
-# -------------------------------------------------------------------
-# Local dev entrypoint (Render uses gunicorn app:app)
-# -------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=True)
